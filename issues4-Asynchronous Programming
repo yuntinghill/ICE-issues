@@ -106,3 +106,163 @@ interface InvitationCallback
 C++映射为每个AMD操作发出一个回调类。
 此回调类由Ice运行时提供，由应用程序用于将调用结果中继回Ice运行时。
 该类的名称根据AMD_ <class> _ <op>的格式形成。 在我们的例子中，该类被命名为AMD_InvitationCallback_invite。 该类支持以下方法：
+// C++
+void ice_response(<params>);
+该方法被应用程序用于向到Ice运行时报告成功完成操作。如果操作具有非空返回类型，则ice_response的第一个参数是返回值。对应于操作的out参数的参数按照声明的顺序遵循返回值。 在我们这种情况下，这种方法如下：
+// C++
+void ice_response(bool);
+
+另外，在操作不成功的情况下，该类还包含几种向运行时报告异常的方法：
+// C ++
+void ice_exception（const Ice :: Exception＆）;
+void ice_exception（const std :: exception＆）;
+void ice_exception（）;
+
+应用程序调用第一种方法来报告用户和本地异常，第二种报告标准异常的方法，以及报告未知异常的第三种方法。
+签名和发送方法的名称也发生变化。方法名称具有后缀 _async（异步调度方法总是void返回类型）。调度方法的第一个参数是指向上述AMD回调类的智能指针。服务器端应用程序代码通过此回调通知Ice运行时间完成操作。调度方法的其余参数是按照声明的顺序进行的操作参数。 AMD的邀请方法的签名变成：
+
+// C++
+virtual void invite_async(const AMD_InvitationCallback_invitePtr&, const string&,const string&, const Current&);
+
+我们在invite_async调用中的策略将是向最终用户显示消息，并将AMD_InvitationCallback_邀请回调添加到待处理邀请的列表中。当被邀请者接受或拒绝邀请时，它会从主线程调用ice_response。这可以立即释放调度线程，并避免我们之前检查过的潜在线程饥饿问题。 （这个过程的交互图见图3）。
+我们来看看实现。首先，我们定义一个代表邀请的课程。 简述版本如下：
+
+// C++
+class Invitation : public IceUtil::Shared
+{
+public:
+  Invitation(const AMD_InvitationCallback_invitePtr& c, const string& user, const string& room) : 
+      _cb(c), _user(user), _room(room) { }
+
+  void accept()
+  {
+    _cb->ice_response(true);
+  }
+
+  void reject()
+  {
+    _cb->ice_response(false);
+  }
+
+  private:
+  const AMD_InvitationCallback_invitePtr _cb; const string _user;
+  const string _room;
+};
+
+typedef IceUtil::Handle<Invitation> InvitationPtr;
+该类的_user和_room成员用于提示被邀请者。 （为了简洁起见，我们不显示此代码。）
+我们还需要一个类来管理一组待处理的邀请。这个类的简短版本如下：
+
+// C++
+class InvitationManager : public IceUtil::Shared, public IceUtil::Mutex
+{
+public:
+  InvitationManager() : _destroy(false){ }
+  
+  void add(const AMD_InvitationCallback_invitePtr& c, const string& user,const string& room)
+  {
+    Lock sync(*this);
+    _invites.push_back( new Invitation(c, user, room));
+  }
+  void accept(unsigned int index)
+  {
+    Lock sync(*this);
+    if(index < _invites.size())
+    {
+      _invites[index]->accept();
+      _invites.erase(
+      _invites.begin()+index);
+    }
+  }
+  
+  void reject(unsigned int index)
+  {
+  // Implementation similar to accept
+  }
+
+private:
+  vector<InvitationPtr> _invites;
+};
+
+typedef IceUtil::Handle<InvitationManager> InvitationManagerPtr;
+
+主线程在提示时向用户显示待处理邀请的列表，并允许用户接受或拒绝每个待处理的邀请。主线程呼叫InvitationManager::accept或InvitationManager::reject通过调用AMD回调接口方法ice_response将适当的回复发送回服务器。接下来，我们需要一个执行邀请回调。
+
+// C++
+class InvitationCallbackI : public InvitationCallback
+{
+public:
+  InvitationCallbackI(const InvitationManagerPtr& manager) :_manager(manager) { }
+  virtual void invite_async(const AMD_InvitationCallback_invitePtr& cb, const string& user,const string& room, const Current& current)
+  {
+    _manager->add(cb, user, room);
+  }
+private:
+  InvitationManagerPtr _manager;
+};
+
+invite_async将邀请添加到邀请管理器中，允许用户稍后接受或拒绝此邀请。
+一旦邀请被添加到管理器中，invite_ async方法就会完成，并且控制线程返回到Ice运行时间，以便它可以用于调度进一步的请求。该应用程序稍后从主线程调用AMD回调，将回复发送回服务器。到目前为止，我们忽视了重要的一次清理。
+具体来说，如果客户端要终止等待的AMD请求会发生什么？答案是客户端将挂起：对Communicator::destroy调用将阻塞直到所有未完成的服务器端请求完成，但是如果客户端尝试终止，显然永远等不到完成。为了解决这个问题，客户端必须在关闭之前回复所有未完成的请求。首先，我们向“邀请”类添加一个cancel方法。这种方法可以合理地做什么？有三种选择：
+1.拒绝邀请。
+2.将InvitationFailedException添加到InvitationCallback :: invite的异常规范中，并以“关闭”的原因抛出此异常。
+3.抛出一个系统异常，如ObjectNotExistException。
+第三个选项是最合适的选项，因为聊天服务器必须准备好接收这个异常。 cancel方法如下：
+
+// C++
+void Invitation::cancel()
+{
+  _cb->ice_exception( ObjectNotExistException(FILE, LINE ));
+}
+接下来我们向InvitationManager添加一个destroy方法。此方法将取消每个待处理的邀请。 客户端在调用Communicator::destroy之前必须调用此方法。
+
+// C++
+void InvitationManager::destroy()
+{
+  Lock sync(*this); 
+  assert(!_destroy);
+  
+  vector<InvitationPtr>::const_iterator p; 
+  for(p = _invites.begin();  p != _invites.end();  ++p)
+  {
+    (*p)->cancel();
+  }
+  _destroy = true;
+}
+
+我们还必须更改InvitationManager :: add方法来拒绝在客户端关闭时到达的新邀请：
+// C++
+void InvitationManager::add(const AMD_InvitationCallback_invitePtr& c, const string& room, const string& user)
+{
+  Lock sync(*this); 
+  InvitationPtr invitation =  new Invitation(c, room, user); 
+  if(_destroy)
+  {
+    invitation->cancel(); 
+    return;
+  }
+  _invites.push_back(invitation);
+}
+
+异步消息调用
+我们现在考虑客户端代码如何实现向被邀请者发送邀请。
+天真的实现将是：
+// C++
+room->invite(user);
+请注意，此方法实际上等待直到受邀用户接受或拒绝邀请。当操作正在进行时（并阻止通话线程），用户无法与任何其他聊天室参与者聊天。幸运的是，我们可以使用AMI来避免在等待响应时阻塞调用线程。首先，我们需要对接口定义应用元数据指令：
+// Slice
+interface ChatRoomParticipant
+{
+  // ...
+  ["ami"] bool invite(string user) throws InvitationFailedException;
+}
+
+C ++映射为每个AMI操作发出抽象回调类。
+Ice运行时间调用此回调类以通知应用程序完成操作。应用程序开发人员必须实现这个回调类。
+该类的名称根据模式AMI_ <class> _ <op>形成。 在我们的例子中，该类被命名为AMI_InvitationCallback_invite。 提供了两种方法：
+// C ++
+void ice_response（<params>）;
+Ice run time调用此方法来报告成功完成调用。 如果操作具有非空值返回类型，则ice_response的第一个参数是返回值。对应于操作的out参数的参数按照返回值按照声明的顺序进行。 在我们的例子中，方法签名如下：
+// C++
+void ice_response(bool);
+此外，回调类包含一个报告用户或本地异常的方法。

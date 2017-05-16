@@ -1,0 +1,108 @@
+介绍
+之前的文章介绍了如何添加多个聊天室到服务器。在本文中，我们将探讨如何允许用户邀请朋友进入聊天室。在这个过程中，我们将对异步消息调用（AMI）和异步消息分派（AMD）的一些使用技术进行概述。
+
+邀请
+在我们开始编写代码之前，让我们讨论我们需要做哪些接口更改来支持聊天室邀请。
+该功能允许现在聊天室中的用户邀请朋友加入他们的聊天室进行聊天。当用户加入聊天室时，用户客户端将被给予一个ChatRoomParticipant接口的代理。客户端使用此代理代表聊天室的参与者进行呼叫。我们将向此接口添加一个邀请方法。邀请人在其ChatRoomParticipant代理上调用邀请朋友进入聊天室。邀请方法以用户的名字邀请，如果接受邀请，返回true，否则返回false。由于其他原因（如通信失败）邀请调用可能会失败，因此我们添加了InvitationFailedException。
+
+// Slice
+exception InvitationFailedException
+{
+  string reason;
+};
+
+interface ChatRoomParticipant
+{
+  // ...
+  bool invite(string user) throws InvitationFailedException;
+};
+
+在被邀请方，我们需要一种方法来通知受邀者（他或她）被邀请到一个聊天室。 我们使用一个简单的回调接口：
+// Slice
+interface InvitationCallback
+{
+  bool invite(string user, string room);
+}
+
+调用此方法会提示受邀者被邀请进入指定的聊天室。如果接受邀请，被邀请者返回true，否则被邀请者返回false。 被邀请者通过在ChatSession接口上调用setInvitationCallback为回调接口提供代理。 有关邀请朋友到聊天室的交互图，请参见图1。
+
+
+// Slice
+interface ChatSession extends Glacier2::Session
+{
+  void setInvitationCallback( InvitationCallback* callback);
+  // ...
+};
+
+客户端支持
+我们来看看InvitationCallback接口的一个可能的实现：
+// C ++
+bool InvitationCallbackI :: invite（const string＆user，const string＆roomName，const Current＆current）
+{
+  Lock sync(*this);
+  cout << user << ": has invited you to join " << "a chat room. Do you accept (y/n)?" << endl; 
+  
+  char c;
+  cin >> c;
+  return c == ‘y’;
+}
+虽然这看起来似乎合理，但不幸的是它不起作用。
+InvitationCallbackI::invite是由Ice run time在主线程以外的线程调用的。但同时，主线程尝试（或不久将尝试）从控制台读取以获得下一行输入（见图2）。
+问题是两个线程不能同时从控制台读取。我们可以尝试协调 main线程和Ice运行时调度线程对控制台的访问。然而这也并不实用，因为它将导致复杂和不可移植的代码。
+您可能会认为限制是由使用原始控制台应用程序引起的，如果是使用一个好用的GUI工具包，这个问题就会消失。不幸的是情况并非如此，因为大多数GUI工具包强制所有GUI交互都要通过单个线程（而且一般是main线程）。
+那还有什么选择来解决这个问题？一个可能的解决方案是向最终用户显示消息，然后阻止线程等待响应。这可以按下面的代码进行。 （请注意，此代码仅用于说明目的，仅限于一个待处理的邀请）
+
+// C++
+class InvitationCallbackI : public InvitationCallback, public IceUtil::Monitor<IceUtil::Mutex>
+//...
+void InvitationCallbackI::waitForResponse()
+{
+  Lock sync(*this); 
+  while(!_haveResponse)
+  {
+  wait();
+  }
+};
+
+void InvitationCallbackI::acceptReject( bool response)
+{
+  Lock sync(*this);
+  _haveResponse = true;
+  _response = response; 
+  notify();
+}
+
+这种方法有一个主要的缺点：每次调用InvitationCallback都会消耗一个线程。如果被邀请者收到了一些邀请函，并且不及时确认它们，最终Ice分派池中的所有线程将被阻止等待受邀者的回复。由于所有发送线程都被阻止，聊天客户端将停止从聊天服务器接收进一步的请求，例如聊天消息。为了解决这个问题，我们可以改变接口如下：
+// Slice
+interface InvitationCallback
+{
+  void invite(string user, string room, int id);
+};
+
+interface ChatSession extends Glacier2::Session
+{
+  void acceptInvitation(int id);
+  void refuseInvitation(int id);
+  // ..
+};
+
+这个想法是每个邀请都关联一个ID。客户端使用关联的ID调用会话接口来接受或拒绝邀请。然而这比我们原来的解决方案要复杂得多：它需要在服务器中增加额外的记录，并且会污染接口。幸运的是，有一个干净而优雅的解决方案来解决这个问题 - 异步消息编程。
+
+异步消息
+异步消息将请求与其响应分离。有两种形式的异步消息传递：
+•客户端形式称为异步方法调用（AMI）。使用AMI，远程方法调用不会阻止客户机中的调用线程。相反调用的结果在可用时被提供给回调。
+•服务端形式称为异步方法调度（AMD）。使用AMD，服务器可以接收方法调用并暂停调用的处理，直到结果可用，而不会在调用期间绑定分派线程。
+我们可以使用AMD来解决当客户端有待处理的邀请时，如何保持客户端响应聊天消息的问题。
+
+异步方法调度
+第一步是使用元数据指令在接口定义中将该方法标记为AMD。请注意，语言映射不能同时支持同步和异步调度模型。将AMD元数据添加到类或方法定义中将以异步调度映射替换同步调度的映射。
+接口现在如下：
+// Slice
+interface InvitationCallback
+{
+  ["amd"] bool invite(string user, string room);
+};
+
+C++映射为每个AMD操作发出一个回调类。
+此回调类由Ice运行时提供，由应用程序用于将调用结果中继回Ice运行时。
+该类的名称根据AMD_ <class> _ <op>的格式形成。 在我们的例子中，该类被命名为AMD_InvitationCallback_invite。 该类支持以下方法：

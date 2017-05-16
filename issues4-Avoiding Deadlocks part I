@@ -1,0 +1,186 @@
+介绍
+使用Ice调用远程对象非常类似于调用常规本地对象，因此很容易忘记分布的现实，把本地和远程调用视为相同处理。
+然而,他们不是:其一,远程调用(具有参数打包,解包和网络通信)比本地调用慢几个数量级。（如果性能很重要，则不
+希望通过20次单独调用检索远程对象的20个数据成员）。其次，很容易在您的应用程序中意外引入死锁。
+正如任何好的计算机科学类将教你的，只有当以下四个条件同时满足时才会发生死锁：
+•互斥：一次只能有一个任务可以持有资源。
+•保持等待：任务在等待获取其他资源的同时保存资源。
+•无抢占：任务可以获取另一个任务持有的资源的唯一方法是等待此任务自愿释放资源。
+•循环等待：有两个或多个等待任务的循环链，每一个任务都等待链中的下一个任务资源。
+避免死锁就是想办法避免这些条件同时达成, 通常是“保持等待”或“循环等待”
+
+这篇两部分文章的第一部分描述了许多常见的死锁，显示了Ice应用程序中这些死锁的示例，并讨论了如何避免这些死锁。 
+它还显示了如何在Ice应用程序中调试分布式的死锁。
+
+第二部分将介绍几种应对死锁的策略：我们应该接受将会发生死锁并使我们的应用程序容忍死锁吗？ 还是应该组织我们的应用程序，使得死锁是不可能的？
+无论如何选择，将死锁视为孤立的问题，以为可以通过单独测试和调试来解决是愚蠢的：必须设计一个健壮的分布式应用程序，以避免出现死锁。
+
+自死锁
+当线程等待自身时，会发生自死锁。一个简单的例子是重新锁定非递归互斥体; 当持有锁时还重复调用就会发生这种情况。
+
+// C++
+// IceUtil::Mutex is a non-recursive mutex
+class Person : public IceUtil::Mutex
+{
+public:
+  string getEmailAddress()
+  {
+    Lock lock(*this);
+    return _login + "@" + _domain;
+  }
+  PersonDescription getDescription()
+  {
+    PersonDescription desc;
+    Lock lock(*this);
+    desc.fullName = _firstName + " " + _lastName;
+    // self-deadlock here
+    desc.email = getEmailAddress();
+    return desc;
+  }
+}
+
+对于这个简单的死锁，有两个常见的解决方案：我们可以通过递归互斥代替IceUtil :: Mutex，或者我们可以定义一个私有非同步的帮助函数，如下所示
+// C++
+class Person : public IceUtil::Mutex
+{
+public:
+  string getEmailAddress()
+  {
+    Lock lock(*this);
+    return getEmailAddressNoSync();
+  }
+  PersonDescription getDescription()
+  {
+    PersonDescription desc;
+    Lock lock(*this);
+    desc.fullName = _firstName + " " + _lastName;
+    desc.email = getEmailAddressNoSync();
+    return desc;
+  }
+private:
+  string getEmailAddressNoSync()
+  {
+    return _loging + "@" + _domain;
+  }
+}
+在分布式情况下也可能会出现自死锁：由于远程调用需要调用线程持有的资源，所以永远等待远程调用的结果是一个常见的错误。
+
+例如，让我们采取众所周知的观察者模式：一个主体在其状态改变时通知一组观察者，并且在通知中，观察者从主体中检索状态信息。 使用这种模式很容易引入自我死锁
+
+// Slice
+interface Subject;
+interface Observer
+{
+  void update(Subject* theChangedSubject);
+};
+
+interface Subject
+{
+  void attach(Observer* newObserver);
+  void detach(Observer* oldObserver);
+  nonmutating string getString();
+};
+
+// C++
+class SubjectI : public Subject,
+public IceUtil::Mutex
+{
+public:
+  // attach and detach implementation, not shown
+  virtual string getString(const Current&) const
+  {
+    Lock lock(*this);
+    return _data;
+  }
+  void setString(const string& data)
+  {
+    {
+      Lock lock(*this);
+      _data = data;
+    }
+    updateObservers();
+  }
+  void updateObservers()
+  {
+    Lock lock(*this);
+    for(list<ObserverPrx>::iterator p = _observers.begin(); p != _observers.end(); ++p)
+    {
+      (*p)->update(_thisProxy);
+    }
+  }
+private:
+  string _data;
+  list<ObserverPrx> _observers;
+  SubjectPrx _thisProxy;
+};
+
+// Java
+public class ObserverI extends _ObserverDisp
+{
+  public void update(SubjectPrx subject, Ice.Current current)
+  {
+    // Get the new string
+    String newString = subject.getString();
+    // Display the new string
+  }
+}
+
+这种执行将立即自我死锁：
+•updateObservers函数锁定互斥体，然后调用观察者的更新（使用Lock lock(*this);）。
+•每个观察者回调getString主题，getString尝试获取由updateObservers函数锁定的互斥体。
+有关此过程的交互图，请参见图1
+
+
+在此应用程序的非分布式版本中，进行更新调用的线程和调用getString的线程是相同的，因此解决方案是使用递归互斥体（IceUtil::RecMutex）而不是常规互斥体。
+但是这种解决方案不适用于远程观察者：调度getString调用的线程是来自SubjectI服务器线程池的线程，并不是等待回复更新的线程。
+当我们发送更新通知时， 我们可以不必等到打破“保持等待”条件。
+// C++
+// Send update as oneway
+ObserverPrx observerOneway = ObserverPrx::uncheckedCast(p->ice_oneway());
+observerOneway->update(_thisProxy)
+这是一个很好的解决方案，只要这些单向呼叫不阻塞！ 请参阅4为什么有时可能会阻塞单向呼叫
+另一个解决方案是为观察者列表和状态使用单独的互斥体，例如*this来保护_data，用_observersMutex来保护_observers。
+使用更多的互斥体，我们必须小心，始终按照相同的顺序锁定它们（_observersMutex，然后*this，永远不会相反），以避免发生获取顺序死锁（见下文）。 
+此外，只要我们保持回调，我们也应该担心下一节讨论的线程问题。
+最后，一个简单可靠的解决方案是改变接口以避免回调
+
+// Slice
+interface Observer
+{
+  void update(Subject* theChangedSubject, string newString);
+}
+updateObservers发送新状态通知，消除了由于回调而导致死锁的风险。 这也将远程呼叫的数量减少了一半。 然而，这种“推”模式有一个缺点：
+主题必须知道到观察者的类型能向他们发送所需的信息
+
+自我死锁与线程
+Ice服务器使用线程池来处理请求。 如果使用默认配置，则服务器（更准确地说，每个Ice Communicator对象）只有一个服务器线程池，并且此池中只有
+一个线程。 这确保所有请求处理都被序列化，当您的服务器实现不是线程安全时，这是有用的。
+但是，使用固定最大大小的线程池可能会导致死锁。这通常与回调相关。 让我们用一个简单的游戏程序来说明这个问题.
+// Slice
+interface Player;
+interface Game
+{
+  void join(Player* newPlayer,
+  string screenName);
+  void leave(Player* p);
+};
+interface Player
+{
+  void message(string fromGame,
+  string fromPlayer, string msg);
+  void logout();
+}
+
+每次有人加入或离开游戏，都向游戏中的其他所有玩家发送消息。玩家的logout操作函数会遍历加入的游戏列表，并在每个游戏中调用leave。 见图
+
+对于这个例子，我们假设所有的调用都是twoway：只有当所有的leave请求已经成功返回时，logout才能成功返回，并且只有当所有的消息请求已成功返回时，
+每个leave请求都将成功返回。
+单向呼叫在这里可能是有意义的，但也可以防止我们想要解决的死锁。
+我们使用两个服务器部署此应用程序：一个服务器托管播放器，而另一个服务器托管游戏。
+注销操作在播放器服务器线程池中消耗一个线程。使用默认配置，这是唯一可用的线程，因此消息操作（对另一个播放器）阻塞，等待线程变为可用。这是一个自我僵局：
+资源（线程池中的线程）正在等待自身可用于其他请求。
+使用较大的线程池（最大大小= n），我们仍然可能遇到这种僵局：我们只需要有更多的玩家（n + 1）同时注销即可获得此死锁。
+请注意，这不是线程饥饿。饥饿是一个调度问题：一个线程永远不会得到CPU，或者由于其他线程而无法获得足够的CPU来完成其任务。
+当有一个循环的等待，就像在这个例子中，这是一个僵局。
+一个解决方案是为线程池选择非常大的最大大小 - 只要较少的玩家同时退出，我们就不会死锁。
+我们还选择一个合理的初始/空闲线程池大小，让大小动态增长和缩小

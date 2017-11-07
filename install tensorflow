@@ -1,0 +1,17 @@
+
+1. install anaconda 64bit
+2  install tensorflow
+  a. cpu version：
+  需要以管理员身份启动cmd，pip install tensorflow   
+  issus：  
+  install tensorflow后，安装其它库时（pip install skyfield) 
+  提示：pip错误：TypeError: parse() got an unexpected keyword argument 'transport_encoding'
+  
+  解决方式：conda install -c anaconda html5lib  
+  
+  b. gpu version: pip install tensorflow-gpu 
+  
+  未能成功
+  
+  
+
